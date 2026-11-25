@@ -1,0 +1,225 @@
+import torch.multiprocessing as mp
+from typing import List
+from lightllm.server.router.model_infer.infer_batch import InferReq
+from lightllm.server.pd_io_struct import PDAbortReq, PDChunckedTransTask
+from lightllm.utils.device_utils import kv_trans_use_p2p
+from lightllm.server.router.model_infer.infer_batch import g_infer_context
+from lightllm.server.router.model_infer.mode_backend.chunked_prefill.impl import ChunkedPrefillBackend
+
+
+class PDChunkedPrefillForPrefillNode(ChunkedPrefillBackend):
+    def __init__(self, info_queue: mp.Queue) -> None:
+        super().__init__()
+        self.support_overlap = False
+        self.info_queue: mp.Queue = info_queue
+        self.classed_req_no_decode = True
+        self.pd_prefill_chunked_handle_func = self._prefill_chuncked_handle_func
+
+    def init_custom(self):
+        assert kv_trans_use_p2p()
+        return
+
+    def _filter_not_ready_reqs(self, req_ids: List[int]) -> List[InferReq]:
+        """
+        将错误请求从 req_ids 中过滤出来, 然后让 _get_classed_reqs 进行处理。 该函数
+        主要用于在 nixl pd 分离模式下, 由子类继承重载, prefill 和 decode 节点过滤 kv 传输错误，或者 kv
+        传输没有完成的请求。
+        """
+        ans_list: List[InferReq] = []
+        for request_id in req_ids:
+            req_obj: InferReq = g_infer_context.requests_mapping[request_id]
+
+            # P 节点的推理请求收到 abort 后，主动通知 KV 传输层停止该请求
+            # 尚未完成的传输任务，避免只能等待 D 节点上报错误或传输超时。
+            pd_abort_req_send_count = getattr(req_obj, "pd_abort_req_send_count", 0)
+            if (
+                self.is_master_in_dp
+                and req_obj.infer_aborted
+                and req_obj.pd_task_num != 0
+                and pd_abort_req_send_count < 6
+            ):
+                self.info_queue.put(PDAbortReq(request_id=req_obj.req_id, device_id=req_obj.pd_trans_device_id))
+                req_obj.pd_abort_req_send_count = pd_abort_req_send_count + 1
+
+            # CPU cache 还在搬运时，cur_kv_len 已经记成命中长度，但 KV 还不能读。
+            if self.args.enable_cpu_cache and (
+                req_obj.cpu_cache_load_task_status.is_running() or req_obj.cpu_cache_offload_task_status.is_running()
+            ):
+                continue
+
+            prefill_finished = req_obj.shm_req.input_len <= req_obj.cur_kv_len
+            if prefill_finished:
+                # 等待所有传输任务都已经完成。
+                if req_obj.pd_task_num == (req_obj.pd_task_failed_num + req_obj.pd_task_success_num):
+                    ans_list.append(req_obj)
+            else:
+                if req_obj.infer_aborted:
+                    if req_obj.pd_task_num == (req_obj.pd_task_failed_num + req_obj.pd_task_success_num):
+                        ans_list.append(req_obj)
+                    else:
+                        continue
+                else:
+                    ans_list.append(req_obj)
+
+        # 上面先按老路径收齐可以结束的请求。挂着 pd_wait_decode_kv_info_ready 表示还在等
+        # decode 端点，这里再把它们留在推理进程里。没挂这个属性的请求不需要等。
+        # 已经 abort 的不再拦，留在名单里走后面的结束路径释放 KV。
+        ready_list: List[InferReq] = []
+        for req_obj in ans_list:
+            prefill_finished = req_obj.shm_req.input_len <= req_obj.cur_kv_len
+            waiting_decode_kv_info = (
+                prefill_finished
+                and req_obj.sampling_param.shm_param.pd_prefill_first
+                and hasattr(req_obj, "pd_wait_decode_kv_info_ready")
+            )
+            if waiting_decode_kv_info and not req_obj.infer_aborted:
+                continue
+            ready_list.append(req_obj)
+        return ready_list
+
+    def _prefill_chuncked_handle_func(
+        self, req_obj: InferReq, next_token_id: int, next_token_prob: float, output_len: int
+    ):
+        """在每一步 chuncked prefill 后，按模式选择传输处理。"""
+        if req_obj.sampling_param.shm_param.pd_prefill_first:
+            self._pf_prefill_chuncked_handle_func(
+                req_obj=req_obj,
+                next_token_id=next_token_id,
+                next_token_prob=next_token_prob,
+                output_len=output_len,
+            )
+            return
+        self._normal_prefill_chuncked_handle_func(
+            req_obj=req_obj,
+            next_token_id=next_token_id,
+            next_token_prob=next_token_prob,
+            output_len=output_len,
+        )
+        return
+
+    def _normal_prefill_chuncked_handle_func(
+        self, req_obj: InferReq, next_token_id: int, next_token_prob: float, output_len: int
+    ) -> None:
+        """老路径边算边传，把已经算完的页交给 kv move。"""
+        assert req_obj.cur_kv_len <= req_obj.shm_req.input_len
+        input_len = req_obj.shm_req.input_len
+        page_size = self.args.pd_kv_page_size
+        assert page_size % self.args.page_size == 0, "pd_kv_page_size must be divisible by page_size"
+        prefill_finished = req_obj.cur_kv_len == input_len
+        trans_task_list: List[PDChunckedTransTask] = []
+        while req_obj.pd_trans_kv_start_index < req_obj.cur_kv_len:
+            cur_page_size = min(page_size, req_obj.cur_kv_len - req_obj.pd_trans_kv_start_index)
+            # 生成页面传输任务， 放入kv move manager 的处理队列中
+            if cur_page_size == page_size or prefill_finished:
+                trans_task = self._create_pd_trans_task(
+                    req_obj=req_obj,
+                    kv_start_index=req_obj.pd_trans_kv_start_index,
+                    kv_end_index=req_obj.pd_trans_kv_start_index + cur_page_size,
+                )
+                req_obj.pd_trans_kv_start_index += cur_page_size
+                trans_task_list.append(trans_task)
+            else:
+                break
+
+        if prefill_finished and len(trans_task_list) != 0 and output_len == 1:
+            if g_infer_context.is_hybrid_att_model:
+                # 混合注意力模型除 KV 外，还需传输 prefill 完成时的请求运行态 buffer（如 linear attention 的 conv/SSM 状态）。
+                trans_task_list.append(
+                    self._create_pd_trans_task(
+                        req_obj=req_obj,
+                        kv_start_index=input_len,
+                        kv_end_index=input_len,
+                        page_kind="att_state",
+                    )
+                )
+            trans_task_list[-1].first_gen_token_id = next_token_id
+            trans_task_list[-1].first_gen_token_logprob = next_token_prob
+
+        if self.is_master_in_dp:
+            for trans_task in trans_task_list:
+                self.info_queue.put(trans_task)
+        return
+
+    def _pf_prefill_chuncked_handle_func(
+        self, req_obj: InferReq, next_token_id: int, next_token_prob: float, output_len: int
+    ) -> None:
+        """PD 分离的 Prefill 先推理模式的请求不算边传。算完后把建传输任务的闭包挂到等待属性上。"""
+        prefill_finished = req_obj.cur_kv_len == req_obj.shm_req.input_len
+        if not prefill_finished or output_len < 1:
+            return
+        if hasattr(req_obj, "pd_wait_decode_kv_info_ready"):
+            return
+
+        def wait_decode_kv_info_ready(backend, req_obj: InferReq) -> None:
+            from ..helper import submit_prefill_first_tasks_if_ready
+
+            submit_prefill_first_tasks_if_ready(
+                backend=backend,
+                req_obj=req_obj,
+                next_token_id=next_token_id,
+                next_token_logprob=next_token_prob,
+            )
+            return
+
+        req_obj.pd_wait_decode_kv_info_ready = wait_decode_kv_info_ready
+        return
+
+    def _on_pf_decode_kv_ready(self, req_id: int) -> None:
+        """Router 通知 decode KV 已就绪。调用等待闭包建传输任务，然后去掉这个属性。"""
+        req_obj: InferReq = g_infer_context.requests_mapping.get(req_id)
+        if req_obj is None or not hasattr(req_obj, "pd_wait_decode_kv_info_ready"):
+            return
+        if not req_obj.infer_aborted:
+            req_obj.pd_wait_decode_kv_info_ready(backend=self, req_obj=req_obj)
+        delattr(req_obj, "pd_wait_decode_kv_info_ready")
+        return
+
+    def _create_pd_trans_task(
+        self,
+        req_obj: InferReq,
+        kv_start_index: int,
+        kv_end_index: int,
+        page_kind: str = "kv",
+    ) -> PDChunckedTransTask:
+        # 确定传输设备
+        if req_obj.pd_trans_device_id == -1:
+            if not hasattr(self, "pd_iter_device_id"):
+                self.pd_iter_device_id = 0
+            req_obj.pd_trans_device_id = self.pd_iter_device_id
+            self.pd_iter_device_id = (self.pd_iter_device_id + 1) % self.node_world_size
+
+        pd_decode_node_info = req_obj.sampling_param.pd_decode_node
+        if page_kind == "kv":
+            mem_indexes = req_obj.token_index.get_cpu_token_indexes(kv_start_index, kv_end_index).tolist()
+            req_idx = None
+        elif page_kind == "att_state":
+            mem_indexes = []
+            req_idx = req_obj.req_idx
+        else:
+            raise ValueError(f"unknown PD trans page kind {page_kind}")
+        trans_task = PDChunckedTransTask(
+            request_id=req_obj.req_id,
+            start_kv_index=kv_start_index,
+            end_kv_index=kv_end_index,
+            time_out_secs=182,
+            pd_master_node_id=req_obj.sampling_param.pd_master_node_id,
+            prefill_dp_index=self.dp_rank_in_node,
+            decode_dp_index=None,
+            src_device_id=req_obj.pd_trans_device_id,
+            dst_device_id=None,
+            mem_indexes=mem_indexes,
+            prefill_agent_name=None,
+            prefill_agent_metadata=None,
+            prefill_num_pages=None,
+            prefill_page_reg_desc=None,
+            decode_agent_name=pd_decode_node_info.agent_name,
+            decode_agent_metadata=pd_decode_node_info.agent_metadata,
+            decode_num_pages=pd_decode_node_info.num_pages,
+            decode_page_reg_desc=pd_decode_node_info.page_reg_desc,
+            first_gen_token_id=None,
+            first_gen_token_logprob=None,
+            page_kind=page_kind,
+            req_idx=req_idx,
+        )
+        req_obj.pd_task_num += 1
+        return trans_task
